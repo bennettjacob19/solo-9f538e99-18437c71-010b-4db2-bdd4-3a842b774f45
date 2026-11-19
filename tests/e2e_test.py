@@ -9,7 +9,10 @@ Covers:
   4. publish v2: new queries use the new version
   5. consistency: answers during concurrent publishes never mix versions
   6. write failure: old version keeps serving, DB untouched, recovery works
-  7. restart: committed version is reloaded, no partial data
+  7. probe engine: settings, healthy/fault/recovery, publish reset, rogue
+     server mismatch, config write failure keeps old settings
+  8. restart: committed version is reloaded, probe settings survive but the
+     old probe success state is not inherited
 
 Run with the project venv python:  /tmp/testvenv/bin/python tests/e2e_test.py
 """
@@ -24,15 +27,18 @@ import time
 
 import dnslib
 import httpx
+from dnslib.server import BaseResolver, DNSServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from app.prober import ProbeEngine, compare, expected_answer  # noqa: E402
 from app.store import Store  # noqa: E402
-from app.zone import ZoneError, parse_zone_text  # noqa: E402
+from app.zone import Snapshot, ZoneError, parse_zone_text  # noqa: E402
 
 WEB = "http://127.0.0.1:18000"
 DNS_PORT = 15353
+ROGUE_PORT = 15399
 LOG = "/tmp/zonedns-e2e-server.log"
 
 PASS, FAIL = [], []
@@ -62,6 +68,41 @@ def publish(text, note=""):
     return httpx.post(WEB + "/publish", data={"zone_text": text, "note": note}, timeout=10)
 
 
+def save_probe(name, port):
+    return httpx.post(WEB + "/probe/settings",
+                      data={"name": name, "port": str(port)}, timeout=10)
+
+
+def probe_status():
+    return httpx.get(WEB + "/api/probe", timeout=5).json()
+
+
+def wait_probe_status(want, timeout=20):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            st = probe_status()
+            last = st
+            if st.get("status") == want:
+                return st
+        except Exception:
+            pass
+        time.sleep(0.3)
+    print(f"  (probe status never became {want}; last={str(last)[:300]})")
+    return None
+
+
+class RogueResolver(BaseResolver):
+    """Answers every A query with a fixed wrong address (no CNAME chain)."""
+
+    def resolve(self, request, handler):
+        reply = request.reply()
+        reply.add_answer(dnslib.RR(str(request.q.qname), dnslib.QTYPE.A,
+                                   rclass=1, ttl=30, rdata=dnslib.A("9.9.9.9")))
+        return reply
+
+
 def wait_ready(proc, timeout=20):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -86,6 +127,8 @@ def start_app(dbpath):
         WEB_HOST="127.0.0.1",
         WEB_PORT="18000",
         REFRESH_INTERVAL="0.5",
+        PROBE_INTERVAL="0.5",
+        PROBE_TIMEOUT="1.0",
     )
     proc = subprocess.Popen(
         [sys.executable, "-m", "app.main"],
@@ -148,6 +191,64 @@ def test_validation():
     check("unit: valid zone parses", set(ok) == {"web.svc.test.", "app.svc.test."})
 
 
+def test_probe_state_machine():
+    snap = Snapshot(7, "ts", {"app.svc.test.": {"A": ["10.0.0.1"], "CNAME": None, "ttl": 60}})
+    eng = ProbeEngine(lambda: snap, interval=0.1, timeout=0.1)
+    eng.apply_settings("app.svc.test.", DNS_PORT)
+    st = eng.status()
+    check("unit: fresh probe settings -> pending", st["status"] == "pending")
+    check("unit: probe expected version from snapshot", st["expected_version"] == 7)
+    ep = st["epoch"]
+    eng._record(ep - 1, 7, "match", "late answer from before the change")
+    eng._record(ep, 6, "match", "answered by an older version")
+    st = eng.status()
+    check("unit: stale probes cannot change state",
+          st["status"] == "pending" and st["ok_streak"] == 0
+          and len(st["history"]) == 1, str(st)[:200])
+    eng._record(ep, 7, "match", "m1")
+    check("unit: one match still pending", eng.status()["status"] == "pending")
+    eng._record(ep, 7, "match", "m2")
+    check("unit: two consecutive matches -> ok", eng.status()["status"] == "ok")
+    eng._record(ep, 7, "timeout", "t1")
+    check("unit: single bad result keeps ok", eng.status()["status"] == "ok")
+    eng._record(ep, 7, "match", "m3")
+    eng._record(ep, 7, "timeout", "t2")
+    check("unit: non-consecutive bad results keep ok", eng.status()["status"] == "ok")
+    eng._record(ep, 7, "mismatch", "bad")
+    check("unit: two consecutive bad -> fault", eng.status()["status"] == "fault")
+    eng._record(ep, 7, "match", "m4")
+    check("unit: single match keeps fault", eng.status()["status"] == "fault")
+    eng._record(ep, 7, "match", "m5")
+    check("unit: two consecutive matches recover", eng.status()["status"] == "ok")
+    eng.note_publish(8)
+    st = eng.status()
+    check("unit: publish resets probe to pending",
+          st["status"] == "pending" and st["ok_streak"] == 0)
+    check("unit: publish clears old probe results",
+          len(st["history"]) == 1 and st["history"][0]["outcome"] == "event")
+
+
+def test_probe_compare():
+    snap = Snapshot(3, "ts", {
+        "web.svc.test.": {"A": ["10.0.0.10", "10.0.0.11"], "CNAME": None, "ttl": 60},
+        "app.svc.test.": {"A": [], "CNAME": "web.svc.test.", "ttl": 60},
+    })
+    exp = expected_answer(snap, "app.svc.test.")
+    check("unit: expected answer from snapshot",
+          exp["rcode"] == "NOERROR"
+          and exp["chain"] == [("app.svc.test.", "web.svc.test.")]
+          and exp["a_set"] == frozenset({"10.0.0.10", "10.0.0.11"}), str(exp))
+    check("unit: compare match (A order irrelevant)",
+          compare(exp, "NOERROR", [("app.svc.test.", "web.svc.test.")],
+                  frozenset({"10.0.0.11", "10.0.0.10"})) is None)
+    check("unit: compare rcode mismatch",
+          "RCODE" in compare(exp, "NXDOMAIN", exp["chain"], exp["a_set"]))
+    check("unit: compare chain mismatch",
+          "CNAME" in compare(exp, "NOERROR", [], exp["a_set"]))
+    check("unit: compare A set mismatch",
+          "A 集合" in compare(exp, "NOERROR", exp["chain"], frozenset({"9.9.9.9"})))
+
+
 # ------------------------------------------------------------------ e2e flow
 def main():
     tmp = tempfile.mkdtemp(prefix="zonedns-e2e-")
@@ -156,6 +257,8 @@ def main():
 
     test_store_atomicity(tmp)
     test_validation()
+    test_probe_state_machine()
+    test_probe_compare()
 
     proc = start_app(db)
     try:
@@ -306,7 +409,106 @@ def main():
         check("e2e: publish works again after recovery", r.status_code == 303,
               f"got {r.status_code}")
 
-        # 8. restart: committed version is reloaded; nothing partial appears
+        # 8. probe engine: settings, healthy, fault, recovery, publish reset
+        r = httpx.get(WEB + "/", timeout=5)
+        check("e2e: index shows probe section", "权威 UDP 探测" in r.text)
+
+        r = save_probe("evil.other.com.", DNS_PORT)
+        check("e2e: probe name outside zone -> 400", r.status_code == 400)
+        r = save_probe("app", "70000")
+        check("e2e: probe port out of range -> 400", r.status_code == 400)
+
+        r = save_probe("app.svc.test.", DNS_PORT)
+        check("e2e: save probe settings -> 303", r.status_code == 303)
+        st = probe_status()
+        check("e2e: probe configured with saved settings",
+              st["configured"]
+              and st["settings"] == {"name": "app.svc.test.", "port": DNS_PORT},
+              str(st)[:200])
+        check("e2e: fresh probe settings -> pending", st["status"] == "pending",
+              st["status"])
+        st = wait_probe_status("ok")
+        check("e2e: probe confirms healthy after 2 matches", st is not None)
+        check("e2e: probe history shows match reasons",
+              st is not None and any(h["outcome"] == "match" and "一致" in h["reason"]
+                                     for h in st["history"]))
+        r = httpx.get(WEB + "/", timeout=5)
+        check("e2e: index shows probe status and recent results",
+              "正常" in r.text and "最近结果" in r.text)
+
+        # fault: probe a port where nothing answers
+        r = save_probe("app.svc.test.", 15999)
+        check("e2e: save dead-port settings -> 303", r.status_code == 303)
+        st = wait_probe_status("fault")
+        check("e2e: unanswered port -> fault after 2 bad probes", st is not None)
+        check("e2e: fault history shows timeout/error reasons",
+              st is not None and any(h["outcome"] in ("timeout", "error")
+                                     for h in st["history"]),
+              str(st["history"][:2]) if st else "")
+
+        # recovery: back to the real DNS port
+        r = save_probe("app.svc.test.", DNS_PORT)
+        check("e2e: restore good port -> 303", r.status_code == 303)
+        st = wait_probe_status("ok")
+        check("e2e: probe recovers after 2 matches", st is not None)
+
+        # publish resets the probe; stale results must not leak into new state
+        r = publish("app CNAME web2\nweb2 A 10.0.0.2 30\n", note="probe reset")
+        check("e2e: publish during probing -> 303", r.status_code == 303)
+        st = probe_status()
+        check("e2e: publish resets probe to pending", st["status"] == "pending",
+              st["status"])
+        check("e2e: probe tracks the newly published version",
+              st["expected_version"]
+              == httpx.get(WEB + "/api/current", timeout=5).json()["version"])
+        check("e2e: old probe results cleared on publish",
+              st["history"] and st["history"][-1]["outcome"] == "event")
+        st = wait_probe_status("ok")
+        check("e2e: probe re-confirms after publish", st is not None)
+
+        # fault: a rogue server answers with wrong data -> mismatch
+        rogue = DNSServer(RogueResolver(), port=ROGUE_PORT,
+                          address="127.0.0.1", tcp=False)
+        rogue.start_thread()
+        try:
+            r = save_probe("app.svc.test.", ROGUE_PORT)
+            check("e2e: point probe at rogue server -> 303", r.status_code == 303)
+            st = wait_probe_status("fault")
+            check("e2e: wrong answers -> fault", st is not None)
+            check("e2e: mismatch reason recorded",
+                  st is not None and any(h["outcome"] == "mismatch"
+                                         and "不符" in h["reason"]
+                                         for h in st["history"]),
+                  str(st["history"][:2]) if st else "")
+        finally:
+            rogue.stop()
+
+        r = save_probe("app.svc.test.", DNS_PORT)
+        check("e2e: restore good port again -> 303", r.status_code == 303)
+        st = wait_probe_status("ok")
+        check("e2e: probe healthy again before restart", st is not None)
+
+        # config write failure: DB path replaced by a directory -> 500,
+        # old settings keep running untouched
+        os.rename(db, db + ".real")
+        os.mkdir(db)
+        try:
+            r = save_probe("web2.svc.test.", 15999)
+            check("e2e: probe settings write failure -> 500", r.status_code == 500,
+                  f"got {r.status_code}")
+            check("e2e: probe write failure page keeps old settings",
+                  "沿用原" in r.text)
+        finally:
+            os.rmdir(db)
+            os.rename(db + ".real", db)
+        st = probe_status()
+        check("e2e: old probe settings still in effect after failed write",
+              st["settings"] == {"name": "app.svc.test.", "port": DNS_PORT},
+              str(st["settings"]))
+        check("e2e: prober still healthy after failed write",
+              st["status"] == "ok", st["status"])
+
+        # 9. restart: committed version is reloaded; nothing partial appears
         last = httpx.get(WEB + "/api/current", timeout=5).json()
         n_versions = len(httpx.get(WEB + "/api/versions", timeout=5).json())
     finally:
@@ -324,6 +526,18 @@ def main():
               len(httpx.get(WEB + "/api/versions", timeout=5).json()) == n_versions)
         r = httpx.get(WEB + "/", timeout=5)
         check("e2e: UI renders after restart", r.status_code == 200 and "当前版本" in r.text)
+
+        # probing continues from saved settings, but old success is not inherited
+        st = probe_status()
+        check("e2e: probe settings survive restart",
+              st["configured"]
+              and st["settings"] == {"name": "app.svc.test.", "port": DNS_PORT},
+              str(st)[:200])
+        check("e2e: old probe success not inherited after restart",
+              st["epoch"] == 1 and "启动" in st["last_change"],
+              str(st)[:300])
+        st = wait_probe_status("ok")
+        check("e2e: probing resumes and re-confirms after restart", st is not None)
     finally:
         stop_app(proc)
 

@@ -1,8 +1,9 @@
-"""Entrypoint: wire up storage, snapshot, DNS server, and web UI.
+"""Entrypoint: wire up storage, snapshot, DNS server, prober, and web UI.
 
 Run:  python -m app.main
 Env:  ZONE_DB (default ./data/zone.db), DNS_BIND (0.0.0.0), DNS_PORT (5353),
-      WEB_HOST (0.0.0.0), WEB_PORT (8000), REFRESH_INTERVAL (2.0 seconds)
+      WEB_HOST (0.0.0.0), WEB_PORT (8000), REFRESH_INTERVAL (2.0 seconds),
+      PROBE_INTERVAL (2.0 seconds), PROBE_TIMEOUT (1.5 seconds)
 """
 
 import os
@@ -14,6 +15,7 @@ import uvicorn
 
 from .deps import runtime
 from .dns_server import start_dns_server
+from .prober import ProbeEngine
 from .store import Store
 from .zone import snapshot_from_rows
 
@@ -73,6 +75,28 @@ def main():
     log(f"authoritative UDP DNS for svc.test. on {dns_bind}:{dns_port}")
 
     threading.Thread(target=refresh_loop, daemon=True).start()
+
+    probe_interval = float(os.environ.get("PROBE_INTERVAL", "2.0"))
+    probe_timeout = float(os.environ.get("PROBE_TIMEOUT", "1.5"))
+    runtime.prober = ProbeEngine(
+        runtime.holder.get,
+        host=runtime.dns_query_host,
+        interval=probe_interval,
+        timeout=probe_timeout,
+    )
+    saved_probe = runtime.store.load_probe_settings()
+    if saved_probe:
+        # Restart: resume probing from the persisted settings, but the state
+        # machine starts from "pending" -- a previous "ok" is never inherited.
+        runtime.prober.apply_settings(
+            saved_probe["name"], saved_probe["port"],
+            note="服务启动，载入已保存的探测设置")
+    threading.Thread(target=runtime.prober.run, daemon=True).start()
+    if saved_probe:
+        log(f"probing {saved_probe['name']} @ {runtime.dns_query_host}:"
+            f"{saved_probe['port']} every {probe_interval:g}s")
+    else:
+        log(f"probe engine idle (no settings yet), interval {probe_interval:g}s")
 
     log(f"web UI on http://{web_host}:{web_port}")
     uvicorn.run("app.web:app", host=web_host, port=web_port, log_level="info")

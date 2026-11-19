@@ -5,6 +5,7 @@ the current_version pointer. Any failure rolls the whole thing back, so the
 database never holds a half-written version and the previous version stays
 current. A restart simply reloads whatever the pointer names."""
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -125,6 +126,45 @@ class Store:
     def load_current(self):
         vid = self.current_version_id()
         return None if vid is None else self.load_version(vid)
+
+    def save_probe_settings(self, name, port):
+        """Persist probe settings (name + local UDP port) atomically.
+
+        Raises on any write failure; the previously saved settings (if any)
+        stay intact, and the caller keeps the old settings in effect.
+        """
+        payload = json.dumps({"name": name, "port": int(port)})
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('probe_settings', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (payload,),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def load_probe_settings(self):
+        """Return {"name": ..., "port": ...} or None if never saved."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'probe_settings'"
+            ).fetchone()
+            if row is None:
+                return None
+            data = json.loads(row["value"])
+            return {"name": data["name"], "port": int(data["port"])}
+        finally:
+            conn.close()
 
     def list_versions(self, limit=50):
         conn = self._connect()

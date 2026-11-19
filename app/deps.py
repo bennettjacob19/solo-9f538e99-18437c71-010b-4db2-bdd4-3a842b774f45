@@ -15,6 +15,7 @@ class Runtime:
         self.dns_query_host = "127.0.0.1"  # where the web UI sends real queries
         self.dns_query_port = 5353
         self.refresh_interval = 2.0  # seconds; DB re-sync safety net
+        self.prober = None  # ProbeEngine, wired up in main
 
 
 runtime = Runtime()

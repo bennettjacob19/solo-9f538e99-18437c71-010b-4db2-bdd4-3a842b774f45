@@ -5,6 +5,9 @@ services:
     ports:
       - "8000:8000/tcp"      # operations web UI
       - "5353:5353/udp"      # authoritative UDP DNS for svc.test.
+    environment:
+      PROBE_INTERVAL: "2.0"  # seconds between probe queries
+      PROBE_TIMEOUT: "1.5"   # per-probe UDP timeout
     volumes:
       - zone-data:/data      # SQLite zone store survives restarts
     restart: unless-stopped

@@ -1,5 +1,6 @@
 """FastAPI operations UI: publish full zone versions, view the current
-version, and issue real DNS queries against the running UDP server."""
+version, issue real DNS queries against the running UDP server, and
+configure/observe the background authoritative-UDP prober."""
 
 import html
 import sys
@@ -73,6 +74,71 @@ def records_table(snap):
     return ("<table><tr><th>名称</th><th>类型</th><th>值</th><th>TTL</th></tr>" + body + "</table>")
 
 
+PROBE_STATUS_LABELS = {"ok": "正常", "fault": "故障",
+                       "pending": "待确认", "unconfigured": "未配置"}
+PROBE_STATUS_COLORS = {"ok": ("#e6f7e6", "#1e7e34"),
+                       "fault": ("#fde8e8", "#b02a37"),
+                       "pending": ("#fff7dd", "#946400"),
+                       "unconfigured": ("#eeeeee", "#555555")}
+PROBE_OUTCOME_LABELS = {"event": "事件", "match": "吻合", "mismatch": "不符",
+                        "timeout": "超时", "error": "错误"}
+
+
+def probe_form(st):
+    snap = current_snapshot()
+    if snap is None or not snap.records:
+        return "<p class='muted'>尚未发布版本，没有可选择的区域内名称。</p>"
+    current = st.get("settings") or {}
+    options = []
+    for name in sorted(snap.records):
+        sel = " selected" if name == current.get("name") else ""
+        options.append("<option value='" + esc(name) + "'" + sel + ">"
+                       + esc(name) + "</option>")
+    port = current.get("port", runtime.dns_query_port)
+    return ("<form method='post' action='/probe/settings'>"
+            "区域内名称 <select name='name'>" + "".join(options) + "</select>　"
+            "本机 UDP 端口 <input type='text' name='port' value='"
+            + str(port) + "' size='6'>　"
+            "<button type='submit'>保存探测设置</button></form>")
+
+
+def probe_block():
+    if runtime.prober is None:
+        return "<p class='muted'>探测引擎未启动。</p>"
+    st = runtime.prober.status()
+    status = st["status"]
+    bg, fg = PROBE_STATUS_COLORS[status]
+    badge = (f"<span style='background:{bg};color:{fg};padding:3px 12px;"
+             f"border-radius:4px;font-weight:bold'>{PROBE_STATUS_LABELS[status]}</span>")
+    parts = ["<p>当前状态：" + badge + "</p>"]
+    if st["configured"]:
+        s = st["settings"]
+        ver = (f"v{st['expected_version']}" if st["expected_version"] is not None
+               else "（无已发布版本）")
+        parts.append(
+            "<p>探测目标：<code>" + esc(s["name"]) + "</code> A → <code>"
+            + esc(st["host"]) + ":" + str(s["port"]) + "</code>　"
+            "比对版本：" + ver + "　"
+            "连续吻合 " + str(st["ok_streak"]) + " 次 / 连续异常 "
+            + str(st["bad_streak"]) + " 次<br>"
+            "<span class='muted'>每 " + f"{st['interval']:g}" + "s 探测一次，超时 "
+            + f"{st['timeout']:g}" + "s；连续 2 次吻合判正常，"
+            "连续 2 次超时或不符判故障；发布新版或修改设置后重新累计。</span></p>"
+            "<p class='muted'>最近状态重置：" + esc(st["last_change"]) + "</p>")
+    else:
+        parts.append("<p class='muted'>尚未保存探测设置；选择名称与端口后开始探测。</p>")
+    parts.append(probe_form(st))
+    rows = []
+    for h in st["history"]:
+        label = PROBE_OUTCOME_LABELS.get(h["outcome"], h["outcome"])
+        rows.append("<tr><td>" + esc(h["ts"]) + "</td><td>" + esc(label)
+                    + "</td><td>" + esc(h["reason"]) + "</td></tr>")
+    if rows:
+        parts.append("<p><b>最近结果</b></p><table><tr><th>时间 (UTC)</th>"
+                     "<th>结果</th><th>原因</th></tr>" + "".join(rows) + "</table>")
+    return "".join(parts)
+
+
 def index_body(msg="", err=""):
     snap = current_snapshot()
     banner = ""
@@ -94,6 +160,9 @@ def index_body(msg="", err=""):
 <h2>当前版本记录</h2>
 {version_info}
 {records_table(snap)}
+
+<h2>权威 UDP 探测 <span class="muted">本机应答是否仍按已发布版本</span></h2>
+{probe_block()}
 
 <h2>发起真实查询（UDP → 本机权威 DNS）</h2>
 <form method="get" action="/query">
@@ -147,6 +216,9 @@ def publish(zone_text: str = Form(...), note: str = Form("")):
             return page(body, title="写入失败", status_code=500)
         # 3) commit succeeded: swap the in-memory snapshot for new queries
         runtime.holder.set(Snapshot(vid, created, parsed))
+    # probes sent against the old version are now stale; re-confirm anew
+    if runtime.prober is not None:
+        runtime.prober.note_publish(vid)
     return RedirectResponse(url=f"/?msg=已发布版本+v{vid}", status_code=303)
 
 
@@ -178,6 +250,45 @@ def query(name: str = "", qtype: str = "A"):
     body = (f"<h2>查询 {esc(qname)} {qtype}</h2><pre>{esc(chr(10).join(lines))}</pre>"
             "<p><a href='/'>返回</a></p>")
     return page(body, title=f"query {qname}")
+
+
+@app.post("/probe/settings", response_class=HTMLResponse)
+def probe_settings(name: str = Form(...), port: str = Form(...)):
+    # 1) validate: in-zone name + a usable UDP port
+    try:
+        qname = fqdn(name)
+    except ValueError as exc:
+        body = (f"<div class='err'>名称无效：{esc(exc)}</div>"
+                "<p><a href='/'>返回</a></p>")
+        return page(body, title="设置无效", status_code=400)
+    try:
+        port_n = int(str(port).strip())
+        if not (1 <= port_n <= 65535):
+            raise ValueError
+    except ValueError:
+        body = ("<div class='err'>端口必须是 1-65535 的整数</div>"
+                "<p><a href='/'>返回</a></p>")
+        return page(body, title="设置无效", status_code=400)
+    # 2) persist first; on write failure the old settings stay in effect
+    try:
+        runtime.store.save_probe_settings(qname, port_n)
+    except Exception as exc:
+        print(f"probe settings write failed: {exc!r}", file=sys.stderr)
+        body = (f"<div class='err'>配置写入失败（{esc(type(exc).__name__)}: {esc(exc)}），\n"
+                "沿用原探测设置，正在进行的探测不受影响。</div>"
+                "<p><a href='/'>返回</a></p>")
+        return page(body, title="写入失败", status_code=500)
+    # 3) only now apply: starts a new probe epoch, old in-flight probes go stale
+    if runtime.prober is not None:
+        runtime.prober.apply_settings(qname, port_n)
+    return RedirectResponse(url="/?msg=探测设置已保存", status_code=303)
+
+
+@app.get("/api/probe")
+def api_probe():
+    if runtime.prober is None:
+        return {"configured": False, "status": "unconfigured", "history": []}
+    return runtime.prober.status()
 
 
 @app.get("/api/current")
